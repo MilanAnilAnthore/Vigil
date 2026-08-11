@@ -1,20 +1,24 @@
 const express = require("express");
 const app = express();
+const { Pool } = require("pg");
+const connectionString = process.env.DATABASE_URL;
 
+console.log(connectionString);
 const port = 3000;
+const pool = new Pool({ connectionString: connectionString, min: 10 });
 
 function apm(req, res, next) {
   const start = process.hrtime.bigint();
-  res.on("finish", () => {
-    const route = req.route?.path;
+  res.on("finish", async () => {
     const end = process.hrtime.bigint();
     const durationInMs = Number(end - start) / 1e6;
-    console.log({
-      duration: durationInMs,
-      method: req.method,
-      route,
-      status: res.statusCode,
-    });
+    const text =
+      "INSERT INTO requests(method, route, status, duration_ms ) VALUES($1, $2, $3, $4)";
+    const values = [req.method, req.route?.path, res.statusCode, durationInMs];
+
+    try {
+      await pool.query(query, values);
+    } catch (err) {}
   });
   next();
 }

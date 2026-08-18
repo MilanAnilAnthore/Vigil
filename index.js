@@ -1,6 +1,6 @@
 const express = require("express");
 const app = express();
-const { Pool } = require("pg");
+const { Pool, Client } = require("pg");
 const connectionString = process.env.DATABASE_URL;
 const { als, getCtx } = require("./lib/als");
 
@@ -13,6 +13,23 @@ const pool = new Pool({
   query_timeout: 3000,
 });
 
+// monkey-patching the pg query to calculate the time a db takes to execute an operation
+// and stores it into the context of that certain req-res cycle
+const original = Client.prototype.query;
+Client.prototype.query = function (...args) {
+  const start = process.hrtime.bigint();
+  const result = original.apply(this, args);
+
+  result.finally(() => {
+    const end = process.hrtime.bigint();
+    const durationInMs = Number(end - start) / 1e6;
+    const text = args[0];
+    getCtx().queries.push({ sql: text, durationInMs });
+  });
+  return result;
+};
+
+// The monitoring middleware that stands between a req-res cycle
 function apm(req, res, next) {
   const start = process.hrtime.bigint();
   res.on("finish", async () => {
@@ -21,8 +38,6 @@ function apm(req, res, next) {
     const text =
       "INSERT INTO requests(method, route, status, duration_ms ) VALUES($1, $2, $3, $4)";
     const values = [req.method, req.route?.path, res.statusCode, durationInMs];
-
-    console.log(getCtx()?.queries?.[0]?.id);
 
     try {
       await pool.query(text, values);
@@ -34,12 +49,9 @@ function apm(req, res, next) {
     next();
   });
 }
-
 app.use(apm);
-let contextId = 0;
+
 app.get("/", async (req, res, next) => {
-  contextId++;
-  getCtx().queries.push({ id: contextId });
   await new Promise((resolve) => setTimeout(resolve, 2000));
   res.send("main route");
 });

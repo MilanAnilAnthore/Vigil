@@ -1,0 +1,43 @@
+{
+  "compilerOptions": {
+    // --- Module system ---
+    // "nodenext" reads the nearest package.json "type" field to decide the
+    // emit format. package.json says "commonjs", so .ts files here compile
+    // import/export -> require()/exports. That is the whole point: write
+    // modern syntax, ship CommonJS.
+    "module": "nodenext",
+
+    // --- Environment ---
+    // Node 22 supports all of ES2023.
+    "target": "es2023",
+    // Pin the lib. Without this, TS silently includes the DOM types, which is
+    // how `sql: Text` type-checked as a DOM text node instead of erroring.
+    "lib": ["es2023"],
+    "types": ["node"],
+
+    // --- File layout (TS7 requires rootDir to be explicit) ---
+    "rootDir": "./src",
+    "outDir": "./dist",
+
+    // --- Outputs ---
+    "sourceMap": true,
+    "declaration": true,
+    "declarationMap": true,
+
+    // --- Type checking ---
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+
+    // --- Interop / correctness ---
+    // verbatimModuleSyntax is deliberately OFF: it forbids ESM syntax in a
+    // CommonJS file (TS1295) and is what was blocking the import -> require
+    // transform. isolatedModules stays on to keep each file independently
+    // transpilable.
+    "isolatedModules": true,
+    "noUncheckedSideEffectImports": true,
+    "moduleDetection": "force",
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts"]
+}

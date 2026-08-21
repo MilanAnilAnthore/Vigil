@@ -1,8 +1,8 @@
-const express = require("express");
+import express from "express";
 const app = express();
-const { Pool, Client } = require("pg");
+import { Pool, Client } from "pg";
 const connectionString = process.env.DATABASE_URL;
-const { als, getCtx } = require("./lib/als");
+import { als, getCtx } from "./lib/als";
 
 const port = 3000;
 const pool = new Pool({
@@ -20,12 +20,19 @@ Client.prototype.query = function (...args) {
   const start = process.hrtime.bigint();
   const result = original.apply(this, args);
 
-  result.finally(() => {
-    const end = process.hrtime.bigint();
-    const durationInMs = Number(end - start) / 1e6;
-    const text = args[0];
-    getCtx().queries.push({ sql: text, durationInMs });
-  });
+  if (result && typeof result === "function") {
+    try {
+      result.finally(() => {
+        const end = process.hrtime.bigint();
+        const durationInMs = Number(end - start) / 1e6;
+        const first = args[0];
+        const text = typeof first === "string" ? first : first?.text;
+        getCtx().queries.push({ sql: text, durationInMs });
+      });
+    } catch (err) {
+      console.log(`An error occured inside patch ${err}`);
+    }
+  }
   return result;
 };
 
@@ -38,7 +45,7 @@ function apm(req, res, next) {
     const text =
       "INSERT INTO requests(method, route, status, duration_ms ) VALUES($1, $2, $3, $4)";
     const values = [req.method, req.route?.path, res.statusCode, durationInMs];
-
+    // console.log(getCtx()?.queries);
     try {
       await pool.query(text, values);
     } catch (err) {
@@ -53,6 +60,11 @@ app.use(apm);
 
 app.get("/", async (req, res, next) => {
   await new Promise((resolve) => setTimeout(resolve, 2000));
+  const text =
+    "INSERT INTO requests(method, route, status, duration_ms ) VALUES($1, $2, $3, $4)";
+  const values = ["TEsT", "/test", 333, 20000];
+  await pool.query(text, values);
+  await pool.query(text, values);
   res.send("main route");
 });
 

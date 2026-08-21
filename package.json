@@ -13,9 +13,10 @@
   "license": "ISC",
   "author": "",
   "type": "commonjs",
-  "main": "index.js",
+  "main": "dist/index.js",
   "scripts": {
-    "dev": "nodemon --env-file=.env index.js",
+    "build": "tsc",
+    "dev": "nodemon --watch src --ext ts --exec \"tsc && node --env-file=.env dist/index.js\"",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
@@ -23,6 +24,10 @@
     "pg": "^8.23.0"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.2.0",
+    "@types/pg": "^8.23.1",
+    "nodemon": "^3.1.14",
+    "typescript": "^7.0.2"
   }
 }

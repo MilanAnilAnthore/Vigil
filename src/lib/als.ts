@@ -8,3 +8,4 @@ const als = new AsyncLocalStorage<StoreContext>();
 const getCtx = (): StoreContext | undefined => als.getStore();
 
 export { als, getCtx };
+export type { StoreContext };

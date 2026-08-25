@@ -20,6 +20,7 @@ pool.on("error", (err) => {
 export async function verifyConnection(): Promise<void> {
   const client = await pool.connect();
   try {
+    // Testing whether the connection is active using a ping
     await client.query("SELECT 1");
   } finally {
     client.release();

@@ -14,23 +14,27 @@ function finalMeasure(
   ctx?.queries.push({ sql, durationInMs });
 }
 
-// Setup a boolean value to prevent double patch
-let installed = false;
+// Create global, shared symbols for our tags
+const PATCHED = Symbol.for("vigil.pg.patched");
+const ORIGINAL = Symbol.for("vigil.pg.original");
+
 // monkey-patching the pg query to calculate the time a db takes to execute an operation
 // and stores it into the context of that certain req-res cycle
 export function instrumentPg(): void {
-  if (installed) return;
-  installed = true;
-
   const original = Client.prototype.query;
-  Client.prototype.query = function (this: Client, ...args: any[]): any {
+
+  // Bail out if the function already has global patched stamp
+  if ((original as any)[PATCHED]) return;
+
+  // Creating the patched wrapper
+  const patched = function (this: Client, ...args: any[]): any {
     const start = process.hrtime.bigint();
     // capturing the store of a request early and passing to the connection since the connection lives outside storeContext
     const ctx = getCtx();
+
     //Check if the last argument is a callback
     const lastArgIndex = args.length - 1;
     const lastArg = args[lastArgIndex];
-
     if (typeof lastArg === "function") {
       // Replace the original callback with a custom wrapper function
       args[lastArgIndex] = function (...cbArgs: any[]) {
@@ -40,21 +44,28 @@ export function instrumentPg(): void {
         return lastArg.apply(this, cbArgs);
       };
     }
-
     // Execute the original query method with modified args
     const result = (original as any).apply(this, args);
-
     // Handle Promise-based executions
     if (typeof result?.then === "function") {
-      try {
-        result.finally(() => {
-          finalMeasure(args, start, ctx);
-        });
-      } catch (err) {
-        console.log(`An error occured inside patch ${err}`);
-      }
+      result.finally(() => finalMeasure(args, start, ctx)).catch(() => {});
     }
 
     return result;
   };
+
+  // Attaching stamps to the wrapper that i just created
+  (patched as any)[PATCHED] = true;
+  (patched as any)[ORIGINAL] = original; // Saving the original for un-instrumenting later
+
+  // Replacing the query method
+  Client.prototype.query = patched;
+}
+
+// a way to undo the patch
+export function uninstrumentPg(): void {
+  const current = Client.prototype.query as any;
+  if (!current?.[PATCHED]) return;
+  // Restore the original function saved earlier
+  Client.prototype.query = current[ORIGINAL];
 }

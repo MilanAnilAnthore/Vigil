@@ -6,7 +6,7 @@ const app = express();
 const port = 3000;
 
 async function main() {
-  verifyConnection();
+  await verifyConnection();
   app.listen(port, () => console.log(`listening to port ${port}`));
 }
 

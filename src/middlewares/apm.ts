@@ -1,14 +1,17 @@
 import { Request, Response, NextFunction } from "express";
 import { pool } from "../config/database";
-import { als, getCtx } from "../lib/als";
+import { als, StoreContext } from "../lib/als";
 import routePattern from "../lib/routePattern";
 
 // The monitoring middleware that stands between a req-res cycle
 export default function apm(req: Request, res: Response, next: NextFunction) {
   // record start time when the middleware runs
   const start: bigint = process.hrtime.bigint();
+
+  const store: StoreContext = { queries: [] };
+
   // a context store that wraps a full request response cycle
-  als.run({ queries: [] }, () => {
+  als.run(store, () => {
     // This executes after a response is finished
     res.on("finish", async () => {
       const end: bigint = process.hrtime.bigint();
@@ -22,7 +25,7 @@ export default function apm(req: Request, res: Response, next: NextFunction) {
           res.statusCode,
           durationInMs,
         ];
-        const ctxQueries = [...(getCtx()?.queries ?? [])];
+        const ctxQueries = [...(store.queries ?? [])];
         const reqDbResponse = await pool.query(requestText, requestValues);
         const requestId = reqDbResponse.rows[0]["request_id"];
         const queryText = `

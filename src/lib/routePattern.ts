@@ -3,11 +3,9 @@ import { Request } from "express";
 export default function fixRoutePattern(req: Request): string {
   // Handle unmatched requests / 404s
   if (!req.route || req.route.path === undefined) {
-    // A check to make sure whether its served by a middleware like use static
+    // No route but still inside a mount, so some middleware answered on its own
+    // (static files, an auth guard). Everything under it becomes one row.
     if (req.baseUrl) {
-      // Theres a chance that someone might put a placeholder for static path and might explode the data
-      // This isnt addressed right now since this is an mvp
-      // I might change this later when i am done with other parts of my code
       return req.baseUrl;
     }
     return "(unmatched)";
@@ -39,6 +37,21 @@ export default function fixRoutePattern(req: Request): string {
     // if its an unknown type we change it into string or if its undefined or null we return empty string
     pathString = String(rawPath ?? "");
   }
+
+  // KNOWN LIMITATION - there might be a cardinality explosion here
+  // Because the baseurl always gets the placeholder values with it, not the
+  // placeholder itself. This fires on ANY use() mount whose path contains a
+  // param, not just odd multi tenant setups. Plain nested rest does it too -
+  // posts.use("/:id/comments", router) stores "/posts/7/comments/:cid" so i
+  // get one route per post id, which breaks GROUP BY route once i start doing
+  // percentiles. Params in a normal app.get("/posts/:id") are fine, the route
+  // keeps its own pattern. Its only mounts that lose it.
+  // To fix it i have to grab the pattern while express is still routing.
+  // Express 5 never stores the declared path on a mount Layer (see
+  // router/lib/layer.js, the path arg only goes into the matcher closure and
+  // layer.path is later overwritten with the matched text), so it genuinely
+  // cant be rebuilt from baseUrl afterwards.
+  // Since this is an mvp i will address it later.
 
   // Clean up slash joining between baseUrl and pathString
   // Strip trailing slashes from baseUrl (unless baseUrl is empty)

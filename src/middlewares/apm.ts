@@ -30,8 +30,8 @@ export default function apm(req: Request, res: Response, next: NextFunction) {
             res.statusCode,
             durationInMs,
           ];
-          const reqDbResponse = await pool.query(requestText, requestValues);
           const ctxQueries = [...store.queries];
+          const reqDbResponse = await pool.query(requestText, requestValues);
           const requestId = reqDbResponse.rows[0]["request_id"];
           const queryText = `
       INSERT INTO queries (request_id, query_text, duration_ms)

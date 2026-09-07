@@ -13,9 +13,10 @@ export default function apm(req: Request, res: Response, next: NextFunction) {
   // a context store that wraps a full request response cycle
   als.run(store, () => {
     // This executes after a response is finished
-    res.on("finish", () => {
+    res.on("close", () => {
       const end: bigint = process.hrtime.bigint();
       const durationInMs: number = Number(end - start) / 1e6;
+      const status = res.writableFinished ? res.statusCode : 499;
 
       // wrapping the insert operation of apm inside als.exit
       // the context is not available/undefined in here
@@ -27,7 +28,7 @@ export default function apm(req: Request, res: Response, next: NextFunction) {
           const requestValues: Array<string | number> = [
             req.method,
             routePattern(req),
-            res.statusCode,
+            status,
             durationInMs,
           ];
           const ctxQueries = [...store.queries];

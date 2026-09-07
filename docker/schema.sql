@@ -19,4 +19,18 @@ CREATE TABLE IF NOT EXISTS queries (
     ON DELETE CASCADE
 );
 
-CREATE INDEX idx_queries_request_id ON queries(request_id);
+CREATE TABLE IF NOT EXISTS orders (
+  order_id BIGSERIAL PRIMARY KEY,
+  user_id  BIGINT NOT NULL,
+  amount   NUMERIC(10,2) NOT NULL,
+  created  TIMESTAMPTZ DEFAULT now()
+);
+
+INSERT INTO orders (user_id, amount)
+SELECT (i % 50) + 1, (random() * 500)::numeric(10,2)
+FROM generate_series(1, 5000) AS i;
+Then fix the index at the bottom and add one:
+
+
+CREATE INDEX IF NOT EXISTS idx_queries_request_id ON queries(request_id);
+CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);

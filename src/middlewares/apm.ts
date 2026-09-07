@@ -13,7 +13,7 @@ export default function apm(req: Request, res: Response, next: NextFunction) {
   // a context store that wraps a full request response cycle
   als.run(store, () => {
     // This executes after a response is finished
-    res.on("finish", async () => {
+    res.on("finish", () => {
       const end: bigint = process.hrtime.bigint();
       const durationInMs: number = Number(end - start) / 1e6;
 

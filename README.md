@@ -35,8 +35,9 @@ install one.
 - ⏱️ **Times every request** with a monotonic clock, measured to the moment the
   response actually finishes — not to the moment your handler returns.
 - 🔗 **Correlates every SQL query to its request**, automatically, across `await`
-  boundaries and under concurrency. No request-id threading, no changes to your
-  route handlers.
+  boundaries, under concurrency, and — the part that took real work — across the
+  connection pool's internal handoffs. No request-id threading, no changes to
+  your route handlers.
 - 🧬 **Auto-instruments `pg`** by patching the driver — promise *and* callback
   call styles, idempotent, and reversible.
 - 🗂️ **Normalizes routes to their patterns** (`/users/:id`, not `/users/1`,
@@ -68,6 +69,13 @@ package. See [Roadmap](#roadmap).
                    └──────────────────────────────────┼───────────┘
                                                       │
                    ┌──────────────────────────────────▼───────────┐
+                   │  patched Pool.prototype.connect              │
+                   │   • the pool may park this callback and let  │
+                   │     another request run it later             │
+                   │   • AsyncResource.bind pins it to the asker  │
+                   └──────────────────────────────────┬───────────┘
+                                                      │
+                   ┌──────────────────────────────────▼───────────┐
                    │  patched Client.prototype.query              │
                    │   • start timer, capture ctx up front        │
                    │   • call through to the original             │
@@ -78,10 +86,10 @@ package. See [Roadmap](#roadmap).
   HTTP response ◄──────────────────────┘
                                        │  res.on('finish')
                    ┌───────────────────▼──────────────────────────┐
-                   │  als.exit(...)   ← so Vigil's own writes      │
-                   │                     aren't recorded as spans  │
-                   │   INSERT INTO requests  → request_id          │
-                   │   INSERT INTO queries   (bulk, FK to request) │
+                   │  als.exit(...)  ← so Vigil's own writes      │
+                   │                    aren't recorded as spans  │
+                   │   INSERT INTO requests  → request_id         │
+                   │   INSERT INTO queries   (bulk, FK to request)│
                    └──────────────────────────────────────────────┘
 ```
 
@@ -89,7 +97,7 @@ package. See [Roadmap](#roadmap).
 | --- | --- |
 | [`src/middlewares/apm.ts`](src/middlewares/apm.ts) | Opens the request context, times the cycle, persists on finish |
 | [`src/lib/als.ts`](src/lib/als.ts) | The `AsyncLocalStorage` instance and the `getCtx()` accessor |
-| [`src/instrumentation/pg.ts`](src/instrumentation/pg.ts) | The `pg` driver patch — timing and query capture |
+| [`src/instrumentation/pg.ts`](src/instrumentation/pg.ts) | The `pg` driver patch — query timing, plus the pool-handoff context bind |
 | [`src/lib/routePattern.ts`](src/lib/routePattern.ts) | Rebuilds the declared route pattern from an Express request |
 | [`src/config/database.ts`](src/config/database.ts) | Telemetry connection pool with bounded timeouts |
 | [`docker/schema.sql`](docker/schema.sql) | The two-table telemetry schema |
@@ -221,8 +229,8 @@ breaks the thing it monitors is worse than no monitoring tool.
 synchronously at call time, while we're still provably inside the request's
 async scope. The `pg` connection is pooled and long-lived — it was created
 outside any request — so by the time the promise settles, the ambient context is
-no longer guaranteed to be the right one. Grabbing the reference early is what
-makes the correlation correct rather than coincidental.
+no longer guaranteed to be the right one. Grabbing the reference early is
+necessary. It is not, on its own, sufficient — which is what §3 is about.
 
 **Handle both call styles.** `pg` accepts `query(text)`, `query(text, values)`,
 `query(config)`, and callback forms. The patch sniffs for a trailing function
@@ -242,7 +250,78 @@ A module-local boolean wouldn't; you'd double-wrap and double-count. The origina
 is stashed under a matching symbol so [`uninstrumentPg()`](src/instrumentation/pg.ts)
 can cleanly restore it, which is what makes the patch testable.
 
-### 3. Route patterns — the cardinality problem
+### 3. Surviving the connection pool
+
+Sections 1 and 2 look complete on their own: the request has a context, and the
+patch reads it at call time. They were still wrong *together*, and the bug is
+worth walking through, because it is precisely the class of failure this project
+exists to catch.
+
+`pool.query()` is not one operation. It is two:
+
+```js
+// pg-pool
+query(text, values, cb) {
+  this.connect((err, client) => {        // ① get me a connection
+    client.query(text, values, ...)      // ② run it  ← the patched method
+  })
+  return response.result                 // returns before ② has happened at all
+}
+```
+
+Step ① is not instant. A pool is finite. Once `max` connections exist and all of
+them are busy, `connect()` **parks your callback on `_pendingQueue` and returns**,
+having executed nothing. Your query then sits there until some *other* request
+finishes and calls `client.release()` — which synchronously drives
+`_pulseQueue()`, shifts your callback off the front of the queue, and runs it
+**on that other request's stack**.
+
+So `const ctx = getCtx()` — correct-looking, and genuinely correct in every
+one-request-at-a-time test — was reading whichever context happened to be live
+at *rescue* time. Worse, the rescuing stack originates in a socket `'data'`
+event, and a socket carries the context it was **created** in for its entire
+life. So the inherited store was typically a long-dead request's, or `undefined`
+for connections opened at boot — in which case `ctx?.queries.push(...)` silently
+no-ops and the query disappears without a trace.
+
+Measured against pg-pool's real queueing logic, `max: 1`, four concurrent
+requests, showing which request's store each query landed in:
+
+| | A | B | C | D |
+| --- | --- | --- | --- | --- |
+| before | A ✅ | **A** ❌ | **A** ❌ | **A** ❌ |
+| after | A ✅ | B ✅ | C ✅ | D ✅ |
+
+The fix is to stop asking *"whose context is live now?"* and start recording
+*"who asked for this?"* — at a point where that answer is provably right.
+`pool.connect()` is called on the requesting handler's own stack, so that is the
+place to capture:
+
+```ts
+Pool.prototype.connect = function (cb) {
+  return typeof cb === "function"
+    ? original.call(this, AsyncResource.bind(cb))
+    : original.call(this, cb);
+};
+```
+
+`AsyncResource.bind` snapshots the live context and re-enters it whenever the
+callback is eventually invoked, from whosever stack. The promise form
+(`await pool.connect()`) is deliberately left unbound: an awaited promise already
+resumes in the *awaiter's* context rather than the resolver's, so binding it
+would be a no-op. This is what `@opentelemetry/instrumentation-pg` does, and for
+this exact reason.
+
+**Why this is the instructive bug.** It cannot occur below `max` concurrent
+connections — so it is invisible in development, invisible to a `curl`, and
+invisible to any test that doesn't deliberately saturate the pool. It then
+degrades in proportion to traffic, and reports nothing while doing so. A monitor
+whose correlation quietly thins out under exactly the load it was built to
+observe is the worst failure mode available to it, and finding it meant reading
+the pool's source rather than trusting that `getStore()` meant what it appeared
+to mean.
+
+### 4. Route patterns — the cardinality problem
 
 Metrics have to be keyed on the route **pattern** (`/users/:id`), not the
 concrete path (`/users/1`). Key on the path and every user id becomes its own
@@ -290,7 +369,7 @@ into a `string` parameter without complaint. The fix that actually re-enabled
 type checking was annotating the helper's return type as `: string` —
 *`any` at an I/O boundary is where strict mode goes to die.*
 
-### 4. Not hurting the host application
+### 5. Not hurting the host application
 
 An APM has to be invisible to the app it watches. Three guarantees:
 
@@ -389,6 +468,13 @@ in waiting.
   so it's deferred behind a documented tripwire.
 - **`pg` only.** Redis, HTTP client calls, and other drivers aren't instrumented
   yet. The context layer is driver-agnostic; only the patch is `pg`-specific.
+- **`pg`'s standard classes only.** The patch targets `Client` and `Pool` as
+  exported by `pg`. `pg.native` builds separate classes, and a dependency that
+  requires `pg-pool` directly bypasses `pg`'s wrapper — neither is instrumented.
+- **The monitored app and Vigil share one pool.** Telemetry writes contend for
+  the same connections as the app's own queries — two extra checkouts per
+  request — and Vigil's `query_timeout` is imposed on the host's queries as a
+  side effect. Splitting the pools is part of the packaging work.
 - **Single process.** No trace propagation across service boundaries.
 - **No retention policy.** Raw samples grow unbounded; there's no rollup or TTL yet.
 - **Not yet packaged.** Vigil currently lives inside the app it instruments rather

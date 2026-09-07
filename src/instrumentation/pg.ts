@@ -1,5 +1,27 @@
-import { Client } from "pg";
+import { Client, Pool } from "pg";
+import { AsyncResource } from "node:async_hooks";
 import { getCtx, StoreContext } from "../lib/als";
+
+const POOL_PATCHED = Symbol.for("vigil.pg.pool.patched");
+const POOL_ORIGINAL = Symbol.for("vigil.pg.pool.original");
+
+// pool.connect() may park the callback in a waiting list and run it later if the limit of connections exceeds,
+// on whichever request happens to release a connection. Bind it so it always
+// resumes in the context of the request that actually asked for it.
+function instrumentPgPool(): void {
+  const original = Pool.prototype.connect;
+  if ((original as any)[POOL_PATCHED]) return;
+
+  const patched = function (this: Pool, cb?: any): any {
+    return typeof cb === "function"
+      ? (original as any).call(this, AsyncResource.bind(cb))
+      : (original as any).call(this, cb);
+  };
+
+  (patched as any)[POOL_PATCHED] = true;
+  (patched as any)[POOL_ORIGINAL] = original;
+  Pool.prototype.connect = patched as any;
+}
 
 // A function measure the end of a sql querie and push to the request store
 function finalMeasure(
@@ -21,6 +43,7 @@ const ORIGINAL = Symbol.for("vigil.pg.original");
 // monkey-patching the pg query to calculate the time a db takes to execute an operation
 // and stores it into the context of that certain req-res cycle
 export function instrumentPg(): void {
+  instrumentPgPool();
   const original = Client.prototype.query;
 
   // Bail out if the function already has global patched stamp
@@ -61,10 +84,21 @@ export function instrumentPg(): void {
   // Replacing the query method
   Client.prototype.query = patched;
 }
+function uninstrumentPgPool(): void {
+  const current = Pool.prototype.connect as any;
+  if (!current?.[POOL_PATCHED]) return;
+  const original = current[POOL_ORIGINAL];
+  delete (Pool.prototype as any).connect; // reveals the inherited original
+  if (Pool.prototype.connect !== original) {
+    // belt-and-braces
+    Pool.prototype.connect = original;
+  }
+}
 
 // a way to undo the patch
 export function uninstrumentPg(): void {
   const current = Client.prototype.query as any;
+  uninstrumentPgPool();
   if (!current?.[PATCHED]) return;
   // Restore the original function saved earlier
   Client.prototype.query = current[ORIGINAL];

@@ -26,11 +26,11 @@ CREATE TABLE IF NOT EXISTS orders (
   created  TIMESTAMPTZ DEFAULT now()
 );
 
+-- Seed only when the table is empty, so re-running this file is safe.
 INSERT INTO orders (user_id, amount)
 SELECT (i % 50) + 1, (random() * 500)::numeric(10,2)
-FROM generate_series(1, 5000) AS i;
-Then fix the index at the bottom and add one:
-
+FROM generate_series(1, 5000) AS i
+WHERE NOT EXISTS (SELECT 1 FROM orders);
 
 CREATE INDEX IF NOT EXISTS idx_queries_request_id ON queries(request_id);
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);

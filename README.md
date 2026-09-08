@@ -33,7 +33,8 @@ install one.
 ## What it does today
 
 - ⏱️ **Times every request** with a monotonic clock, measured to the moment the
-  response actually finishes — not to the moment your handler returns.
+  response socket actually closes — not to the moment your handler returns — so
+  requests the client abandons get recorded too, instead of silently vanishing.
 - 🔗 **Correlates every SQL query to its request**, automatically, across `await`
   boundaries, under concurrency, and — the part that took real work — across the
   connection pool's internal handoffs. No request-id threading, no changes to
@@ -84,7 +85,7 @@ package. See [Roadmap](#roadmap).
                    └──────────────────────────────────────────────┘
                                        │
   HTTP response ◄──────────────────────┘
-                                       │  res.on('finish')
+                                       │  res.on('close')
                    ┌───────────────────▼──────────────────────────┐
                    │  als.exit(...)  ← so Vigil's own writes      │
                    │                    aren't recorded as spans  │
@@ -95,7 +96,7 @@ package. See [Roadmap](#roadmap).
 
 | File | Responsibility |
 | --- | --- |
-| [`src/middlewares/apm.ts`](src/middlewares/apm.ts) | Opens the request context, times the cycle, persists on finish |
+| [`src/middlewares/apm.ts`](src/middlewares/apm.ts) | Opens the request context, times the cycle, persists on close |
 | [`src/lib/als.ts`](src/lib/als.ts) | The `AsyncLocalStorage` instance and the `getCtx()` accessor |
 | [`src/instrumentation/pg.ts`](src/instrumentation/pg.ts) | The `pg` driver patch — query timing, plus the pool-handoff context bind |
 | [`src/lib/routePattern.ts`](src/lib/routePattern.ts) | Rebuilds the declared route pattern from an Express request |
@@ -135,10 +136,15 @@ cp .env.example .env      # DATABASE_URL=postgresql://postgres:<pw>@localhost:54
 npm run dev
 ```
 
-**4. Generate some traffic.**
+**4. Generate some traffic.** The demo app has one fast route, one deliberately
+slow one that runs two queries against an un-indexed column, one that errors,
+and one parameterized route to exercise pattern normalization.
 
 ```bash
-curl http://localhost:3000/
+curl http://localhost:3000/fast
+curl http://localhost:3000/slow
+curl http://localhost:3000/orders/1
+curl http://localhost:3000/boom      # answers 500 on purpose
 ```
 
 **5. Look at what was recorded.**
@@ -194,7 +200,7 @@ call chain — through promises, timers, callbacks, everything spawned inside it
 ```ts
 const store: StoreContext = { queries: [] };
 als.run(store, () => {
-  res.on("finish", async () => { /* ...read store.queries here... */ });
+  res.on("close", () => { /* ...read store.queries here... */ });
   next();
 });
 ```
@@ -284,13 +290,23 @@ life. So the inherited store was typically a long-dead request's, or `undefined`
 for connections opened at boot — in which case `ctx?.queries.push(...)` silently
 no-ops and the query disappears without a trace.
 
-Measured against pg-pool's real queueing logic, `max: 1`, four concurrent
-requests, showing which request's store each query landed in:
+Follow pg-pool's queueing logic with `max: 1` and four concurrent requests —
+A, B, C, D — tracing which request's store each query lands in. A opens the only
+connection and runs. B, C and D find the pool saturated and park on
+`_pendingQueue`. When A's query returns, the socket `'data'` event that delivers
+the result calls `release()`, which synchronously drains the queue — so B, C and
+D all execute inside the context that socket was *created* in, which is A's:
 
 | | A | B | C | D |
 | --- | --- | --- | --- | --- |
-| before | A ✅ | **A** ❌ | **A** ❌ | **A** ❌ |
-| after | A ✅ | B ✅ | C ✅ | D ✅ |
+| without the bind | A ✅ | **A** ❌ | **A** ❌ | **A** ❌ |
+| with it | A ✅ | B ✅ | C ✅ | D ✅ |
+
+> That table is what the mechanism predicts, not a measurement reported here.
+> Pinning it down belongs in the [test suite](#roadmap) rather than in prose,
+> precisely because the failure is invisible below `max` concurrent connections:
+> if it ever regresses, nothing announces it — the correlation just quietly
+> thins out under load.
 
 The fix is to stop asking *"whose context is live now?"* and start recording
 *"who asked for this?"* — at a point where that answer is provably right.
@@ -371,16 +387,26 @@ type checking was annotating the helper's return type as `: string` —
 
 ### 5. Not hurting the host application
 
-An APM has to be invisible to the app it watches. Three guarantees:
+An APM has to be invisible to the app it watches.
 
-**It never adds latency.** All telemetry writes happen in `res.on("finish")` —
+**It never adds latency.** All telemetry writes happen in `res.on("close")` —
 after the response bytes are out the door. The user has already been served.
+
+**It still records the requests that die.** The obvious listener is `finish`,
+which fires once the last byte is handed to the OS. But `finish` never fires
+when a client hangs up mid-response — so abandoned requests, exactly the ones
+worth looking at during an incident, would disappear from telemetry entirely.
+`close` fires either way, and `res.writableFinished` tells the two apart: a
+completed response records its real status, an aborted one records `499`
+(nginx's "Client Closed Request"). The tradeoff is that queries still in flight
+when the socket closes aren't captured — an aborted request records what it had
+actually managed to run, which is the honest answer anyway.
 
 **It can't take the app down.** The whole write path sits in a `try/catch` that
 swallows. If the telemetry database is unreachable, the monitored app doesn't
 notice.
 
-**It doesn't monitor itself.** This one is subtle. The `finish` handler was
+**It doesn't monitor itself.** This one is subtle. The `close` handler was
 registered *inside* `als.run`, so it inherits the request's context — meaning
 Vigil's own `INSERT`s would flow through the patched `pg` driver, find a live
 context, and push themselves in as queries. Wrapping the writes in
@@ -471,6 +497,12 @@ in waiting.
 - **`pg`'s standard classes only.** The patch targets `Client` and `Pool` as
   exported by `pg`. `pg.native` builds separate classes, and a dependency that
   requires `pg-pool` directly bypasses `pg`'s wrapper — neither is instrumented.
+- **Promise and callback call styles only.** `pg` also accepts a *submittable* —
+  `client.query(new Cursor(sql))`, and query objects like `pg-query-stream`.
+  Those return neither a promise nor take a completion callback, so there is
+  nothing for the patch to hang a timer off, and the query is not recorded.
+  Detecting them means sniffing for a `submit` method and hooking the object's
+  own lifecycle events, which is a separate mechanism from the two here.
 - **The monitored app and Vigil share one pool.** Telemetry writes contend for
   the same connections as the app's own queries — two extra checkouts per
   request — and Vigil's `query_timeout` is imposed on the host's queries as a
@@ -492,7 +524,8 @@ in waiting.
 - [ ] Dashboard — slowest endpoints, latency over time, and the slowest *queries*
       per endpoint (surfacing the correlation is the whole point)
 - [ ] Distribution as drop-in middleware: `app.use(vigil({ dsn, serviceName }))`
-- [ ] Test suite and CI
+- [ ] Test suite and CI — starting with the percentile math, and a
+      pool-saturation test that pins the context-propagation fix above
 - [ ] Grounded anomaly explanation — detect a p99 spike, gather the real traces
       from that window, and have an LLM reason *only* from that data
 

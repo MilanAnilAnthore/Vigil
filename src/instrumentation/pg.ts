@@ -23,6 +23,21 @@ function instrumentPgPool(): void {
   Pool.prototype.connect = patched as any;
 }
 
+// pg takes the query as a plain string, as an object with text, or for a
+// prepared statement as an object with only a name and no text. That last one
+// was pushing undefined which saves as NULL, and NULL doesnt group and doesnt
+// match a WHERE, so the query is counted but you cant find it. So always hand
+// back a string, same idea as (unmatched) in routePattern
+function extractSql(first: unknown): string {
+  if (typeof first === "string") return first;
+  if (first && typeof first === "object") {
+    const config = first as { text?: unknown; name?: unknown };
+    if (typeof config.text === "string") return config.text;
+    if (typeof config.name === "string") return `(prepared: ${config.name})`;
+  }
+  return "(unknown)";
+}
+
 // A function measure the end of a sql querie and push to the request store
 function finalMeasure(
   args: any[],
@@ -31,8 +46,7 @@ function finalMeasure(
 ): void {
   const end: bigint = process.hrtime.bigint();
   const durationInMs: number = Number(end - start) / 1e6;
-  const first = args[0];
-  const sql: string = typeof first === "string" ? first : first?.text;
+  const sql: string = extractSql(args[0]);
   ctx?.queries.push({ sql, durationInMs });
 }
 
